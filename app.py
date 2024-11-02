@@ -82,7 +82,7 @@ for message in st.session_state.chat_history:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-user_input = st.chat_input("Ask here!")
+user_input = st.text_input("Ask here!")
 
 if user_input:
     st.session_state.chat_history.append({"role": "user", "content": user_input})
