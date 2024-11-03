@@ -77,10 +77,17 @@ if uploaded_file:
 
     if "conversation_chain" not in st.session_state:
         st.session_state.conversation_chain = create_chain(st.session_state.vectorstore)
-
+# Iterate through the chat history and display messages
 for message in st.session_state.chat_history:
-    with st.chat_message(message["role"]):
+    if message["role"] == "user":
+        # Display user's message
+        st.write("**User:**")
         st.markdown(message["content"])
+    elif message["role"] == "assistant":
+        # Display assistant's message
+        st.write("**Assistant:**")
+        st.markdown(message["content"])
+
 
 user_input = st.text_area("Ask here!")
 
