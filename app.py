@@ -77,34 +77,21 @@ if uploaded_file:
 
     if "conversation_chain" not in st.session_state:
         st.session_state.conversation_chain = create_chain(st.session_state.vectorstore)
-# Iterate through the chat history and display messages
+
 for message in st.session_state.chat_history:
-    if message["role"] == "user":
-        # Display user's message
-        st.write("**User:**")
-        st.markdown(message["content"])
-    elif message["role"] == "assistant":
-        # Display assistant's message
-        st.write("**Assistant:**")
+    with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-
-user_input = st.text_area("Ask here!")
+user_input = st.chat_input("Ask here!")
 
 if user_input:
     st.session_state.chat_history.append({"role": "user", "content": user_input})
 
-    # Display user's message
-    st.write("**User:**")
-    st.markdown(user_input)
+    with st.chat_message("user"):
+        st.markdown(user_input)
 
-    # Get the assistant's response
-    response = st.session_state.conversation_chain({"question": user_input})
-    assistant_response = response["answer"]
-    
-    # Display assistant's response
-    st.write("**Assistant:**")
-    st.markdown(assistant_response)
-
-    # Store assistant's response in session state
-    st.session_state.chat_history.append({"role": "assistant", "content": assistant_response})
+    with st.chat_message("assistant"):
+        response = st.session_state.conversation_chain({"question": user_input})
+        assistant_response = response["answer"]
+        st.markdown(assistant_response)
+        st.session_state.chat_history.append({"role": "assistant", "content": assistant_response})
