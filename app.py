@@ -33,7 +33,7 @@ def setup_vectorstore(documents):
 
 def create_chain(vectorstore):
     llm = ChatGroq(
-        model="llama-3.1-70b-versatile",
+        model="llama-3.3-70b-versatile",
         temperature=0
     )
     retriever = vectorstore.as_retriever()
