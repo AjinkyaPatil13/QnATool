@@ -1,90 +1,144 @@
+"""Streamlit UI for the PDF question-answering app.
+
+All retrieval and chain logic lives in rag_core.py so it can be tested without
+starting Streamlit.
+"""
+
+import hashlib
 import os
-from dotenv import load_dotenv
+from pathlib import Path
+
 import streamlit as st
-from langchain_community.document_loaders import PyPDFLoader  # Changed loader
-from langchain_text_splitters.character import CharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_groq import ChatGroq
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain
+from dotenv import load_dotenv
+from langchain.globals import set_verbose
+from langchain_core.messages import AIMessage, HumanMessage
 
-# Load environment variables
+import rag_core as rag
+
 load_dotenv()
+set_verbose(os.getenv("RAG_VERBOSE") == "1")
 
-working_dir = os.path.dirname(os.path.abspath(__file__))
+CACHE_DIR = Path(os.getenv("RAG_CACHE_DIR", Path(__file__).parent / ".faiss_cache"))
 
-def load_document(file_path):
-    loader = PyPDFLoader(file_path)  # Using PDF loader without poppler dependency
-    documents = loader.load()
-    return documents
-
-def setup_vectorstore(documents):
-    embeddings = HuggingFaceEmbeddings()
-    text_splitter = CharacterTextSplitter(
-        separator="\n",  # Fixed newline character
-        chunk_size=1000,
-        chunk_overlap=200
-    )
-    doc_chunks = text_splitter.split_documents(documents)
-    return FAISS.from_documents(doc_chunks, embeddings)
-
-def create_chain(vectorstore):
-    llm = ChatGroq(
-        model="llama-3.3-70b-versatile",
-        temperature=0
-    )
-    return ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vectorstore.as_retriever(),
-        memory=ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True
-        ),
-        chain_type="map_reduce",
-        verbose=True
-    )
-
-# Streamlit UI setup
 st.set_page_config(
     page_title="Chat with Doc",
     page_icon="📄",
-    layout="centered"
+    layout="centered",
 )
-st.title("Question Answering Tool")
 
-# Initialize session state
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
 
-# File upload handling
-uploaded_file = st.file_uploader("Upload PDF file", type=["pdf"])
-if uploaded_file:
-    file_path = os.path.join(working_dir, uploaded_file.name)
-    with open(file_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    
-    # Initialize components only once
-    if "conversation_chain" not in st.session_state:
-        documents = load_document(file_path)
-        vectorstore = setup_vectorstore(documents)
-        st.session_state.conversation_chain = create_chain(vectorstore)
+@st.cache_resource(show_spinner=False)
+def get_embeddings():
+    """Load the embedding model once per process, not once per session."""
+    return rag.get_embeddings()
 
-# Display chat history
-for message in st.session_state.chat_history:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
 
-# Chat input handling
-if prompt := st.chat_input("Ask your question..."):
-    # Add user message to history and display
-    st.session_state.chat_history.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-    
-    # Get and display assistant response
-    with st.chat_message("assistant"):
-        response = st.session_state.conversation_chain({"question": prompt})
-        answer = response["answer"]
-        st.markdown(answer)
-        st.session_state.chat_history.append({"role": "assistant", "content": answer})
+@st.cache_resource(show_spinner=False)
+def get_vectorstore(doc_id: str, _file_bytes: bytes):
+    """Reuse the index for a given file, from disk if possible.
+
+    `_file_bytes` is deliberately excluded from the cache key: hashing multiple
+    megabytes on every rerun is wasted work when `doc_id` is already a hash of
+    the file contents.
+    """
+    cache_path = CACHE_DIR / doc_id
+    if cache_path.exists():
+        return rag.load_vectorstore(str(cache_path), get_embeddings())
+
+    chunks = rag.split_documents(rag.load_pdf(_file_bytes))
+    store = rag.build_vectorstore(chunks, get_embeddings())
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    rag.save_vectorstore(store, str(cache_path))
+    return store
+
+
+def stream_answer(chain, question: str, history: list):
+    """Yield answer tokens and stash the retrieved chunks for the sources panel."""
+    st.session_state.sources = []
+    for chunk in chain.stream({"input": question, "chat_history": history}):
+        if "context" in chunk:
+            st.session_state.sources = chunk["context"]
+        if "answer" in chunk:
+            yield chunk["answer"]
+
+
+def render_sources(sources) -> None:
+    if not sources:
+        return
+    with st.expander(f"Sources ({len(sources)} chunks)"):
+        for doc in sources:
+            preview = doc.page_content.strip()
+            if len(preview) > 600:
+                preview = preview[:600] + "…"
+            st.markdown(f"**Page {doc.metadata.get('page', '?')}**")
+            st.caption(preview)
+
+
+def main() -> None:
+    st.title("Question Answering Tool")
+    st.caption("Upload a PDF, then ask questions about it.")
+
+    if not os.getenv("GROQ_API_KEY"):
+        st.error("GROQ_API_KEY is not set. Add it to .env or Streamlit secrets.")
+        return
+
+    with st.sidebar:
+        k = st.slider("Chunks to retrieve", 1, 10, rag.DEFAULT_K)
+        model = st.text_input(
+            "Groq model", os.getenv("GROQ_MODEL", rag.DEFAULT_MODEL)
+        )
+        if st.button("Clear conversation", use_container_width=True):
+            st.session_state.messages = []
+            st.session_state.sources = []
+            st.rerun()
+        if st.session_state.get("doc_id"):
+            st.caption(f"Index: {st.session_state.doc_id}")
+
+    uploaded_file = st.file_uploader("Upload PDF file", type=["pdf"])
+    if uploaded_file is None:
+        st.info("Upload a PDF to get started.")
+        return
+
+    file_bytes = uploaded_file.getvalue()
+    doc_id = hashlib.sha256(file_bytes).hexdigest()[:12]
+
+    # Rebuild whenever the file changes, so a second upload is never silently
+    # answered from the first document's index.
+    if st.session_state.get("doc_id") != doc_id:
+        try:
+            with st.spinner(
+                "Indexing document… (the first run also downloads the embedding model)"
+            ):
+                st.session_state.vectorstore = get_vectorstore(doc_id, file_bytes)
+        except Exception as exc:
+            st.error(f"Could not index this PDF: {exc}")
+            return
+        st.session_state.doc_id = doc_id
+        st.session_state.messages = []
+        st.session_state.sources = []
+
+    for message in st.session_state.messages:
+        role = "user" if isinstance(message, HumanMessage) else "assistant"
+        with st.chat_message(role):
+            st.markdown(message.content)
+
+    if prompt := st.chat_input("Ask a question about the document…"):
+        st.session_state.messages.append(HumanMessage(prompt))
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        chain = rag.build_chain(st.session_state.vectorstore, model=model, k=k)
+        history = st.session_state.messages[:-1]
+
+        with st.chat_message("assistant"):
+            try:
+                answer = st.write_stream(stream_answer(chain, prompt, history))
+            except Exception as exc:
+                st.error(f"Request failed: {exc}")
+                return
+            render_sources(st.session_state.get("sources"))
+
+        st.session_state.messages.append(AIMessage(answer))
+
+
+main()
